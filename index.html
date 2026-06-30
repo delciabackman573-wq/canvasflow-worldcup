@@ -75,6 +75,23 @@
     select, input {
       color-scheme: dark;
     }
+    #predictor {
+      max-width: 100%;
+      overflow: hidden;
+    }
+    @media (max-width: 520px) {
+      #homeScore,
+      #awayScore {
+        width: 3.75rem;
+        height: 3.75rem;
+        font-size: 2.25rem;
+      }
+      #primaryScoreLabel,
+      #alternateScoreLabel {
+        font-size: 1rem;
+        line-height: 1.45;
+      }
+    }
     .reveal {
       opacity: 0;
       transform: translateY(18px);
@@ -350,7 +367,7 @@
             <p class="text-xs font-black uppercase tracking-[0.22em] text-[#dbff63]">Match Board</p>
             <h2 class="mt-2 text-3xl font-black">预测候选赛程</h2>
           </div>
-          <p class="max-w-xl text-sm leading-6 text-white/55">优先读取 TheStatsAPI 的 2026 世界杯完整赛程；若网络不可用，则使用已内置的 2026-06-26/27 真实赛程兜底。</p>
+          <p class="max-w-xl text-sm leading-6 text-white/55">优先读取 WorldCup26 实时赛程/比分/赛果；若网络不可用，则切换到赛程兜底数据，保证页面可用。</p>
         </div>
         <div id="dataStatus" class="mb-4 rounded-lg border border-white/10 bg-white/[0.04] px-4 py-3 text-xs font-bold text-white/55">正在读取真实赛程数据...</div>
         <div id="fixtureGrid" class="grid gap-4 md:grid-cols-2 xl:grid-cols-4"></div>
@@ -452,11 +469,15 @@
       eloRatings: {},
       eloFixtures: [],
       teamCodes: {},
+      liveSource: "fallback",
+      liveUpdatedAt: null,
+      stadiums: {},
       weatherCache: {},
       history: JSON.parse(localStorage.getItem("canvasflow_predictions") || "[]")
     };
 
     const byId = (id) => document.getElementById(id);
+    const liveApiBase = "https://worldcup26.ir";
     const teamAliases = {
       "Argentina": "AR", "Spain": "ES", "France": "FR", "England": "EN", "Brazil": "BR",
       "Portugal": "PT", "Belgium": "BE", "Croatia": "HR", "Uruguay": "UY", "Senegal": "SN",
@@ -466,6 +487,38 @@
       "Australia": "AU", "Paraguay": "PY", "Mexico": "MX", "South Africa": "ZA", "Korea Republic": "KR",
       "Czechia": "CZ", "Canada": "CA", "Bosnia and Herzegovina": "BA", "Haiti": "HT", "Scotland": "SCT",
       "Congo DR": "CD", "Uzbekistan": "UZ"
+    };
+    const apiTeamNameMap = {
+      "Turkey": "Turkiye",
+      "Czech Republic": "Czechia",
+      "South Korea": "Korea Republic",
+      "Iran": "IR Iran",
+      "USA": "United States",
+      "United States": "United States"
+    };
+    const citySlugMap = {
+      "Mexico City": "mexico-city",
+      "Guadalajara": "guadalajara",
+      "Guadalajara (Zapopan)": "guadalajara",
+      "Monterrey": "monterrey",
+      "Monterrey (Guadalupe)": "monterrey",
+      "Dallas": "dallas",
+      "Dallas (Arlington, Texas)": "dallas",
+      "Houston": "houston",
+      "Atlanta": "atlanta",
+      "Miami": "miami",
+      "Miami Gardens": "miami",
+      "Kansas City": "kansas-city",
+      "Philadelphia": "philadelphia",
+      "New York": "new-york",
+      "New York New Jersey": "new-york",
+      "Los Angeles": "los-angeles",
+      "Inglewood": "los-angeles",
+      "San Francisco": "san-francisco",
+      "Seattle": "seattle",
+      "Toronto": "toronto",
+      "Vancouver": "vancouver",
+      "Boston": "boston"
     };
     const stadiumCoords = {
       "boston": { lat: 42.0909, lon: -71.2643, label: "Boston / Gillette Stadium" },
@@ -527,6 +580,85 @@
       return response.text();
     }
 
+    async function fetchTextAny(paths) {
+      let lastError;
+      for (const path of paths) {
+        try {
+          return await fetchText(path);
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw lastError;
+    }
+
+    async function fetchJson(path) {
+      const response = await fetch(path, { cache: "no-store" });
+      if (!response.ok) throw new Error(`failed to load ${path}`);
+      return response.json();
+    }
+
+    function normalizeApiTeamName(name) {
+      return apiTeamNameMap[name] || name;
+    }
+
+    function parseApiDate(value) {
+      const match = String(value || "").match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})/);
+      if (!match) return { date: "", kickoffUtc: "" };
+      const [, mm, dd, yyyy, hour, minute] = match;
+      const date = `${yyyy}-${mm}-${dd}`;
+      return { date, kickoffUtc: `${date}T${hour}:${minute}:00Z` };
+    }
+
+    function cleanScorers(value) {
+      if (!value || value === "null") return "";
+      return String(value).replace(/[{}"]/g, "").split(",").map((item) => item.trim()).filter(Boolean).join(" · ");
+    }
+
+    function normalizeLiveStatus(game) {
+      const elapsed = String(game.time_elapsed || "").trim();
+      const finished = String(game.finished).toUpperCase() === "TRUE" || elapsed.toLowerCase() === "finished";
+      const hasScore = game.home_score !== "" && game.away_score !== "" && game.home_score != null && game.away_score != null;
+      const live = hasScore && !finished && elapsed && elapsed !== "notstarted";
+      if (finished) return { kind: "finished", label: "已完赛", tone: "bg-white/12 text-white/70" };
+      if (live) return { kind: "live", label: `${elapsed}' 进行中`, tone: "bg-[#dbff63] text-[#06110f]" };
+      return { kind: "scheduled", label: "未开赛", tone: "bg-white/8 text-white/58" };
+    }
+
+    function normalizeWorldCup26Game(game) {
+      const time = parseApiDate(game.local_date);
+      const stadium = state.stadiums[game.stadium_id] || {};
+      const homeScore = Number(game.home_score);
+      const awayScore = Number(game.away_score);
+      const status = normalizeLiveStatus(game);
+      return {
+        matchNumber: Number(game.id),
+        date: time.date,
+        kickoffUtc: time.kickoffUtc,
+        stage: game.type || "group-stage",
+        group: game.group || "",
+        homeTeam: normalizeApiTeamName(game.home_team_name_en),
+        awayTeam: normalizeApiTeamName(game.away_team_name_en),
+        stadium: stadium.name_en || `Stadium ${game.stadium_id}`,
+        hostCity: citySlugMap[stadium.city_en] || citySlugMap[(stadium.city_en || "").replace(/\s*\(.+\)\s*/, "")] || "",
+        status: status.kind,
+        statusLabel: status.label,
+        statusTone: status.tone,
+        homeScore: Number.isFinite(homeScore) ? homeScore : null,
+        awayScore: Number.isFinite(awayScore) ? awayScore : null,
+        homeScorers: cleanScorers(game.home_scorers),
+        awayScorers: cleanScorers(game.away_scorers),
+        dataSource: "WorldCup26 live API"
+      };
+    }
+
+    function fixtureSortValue(fixture) {
+      const time = new Date(fixture.kickoffUtc || fixture.date).getTime() || 0;
+      if (fixture.status === "live") return time - 100000000000;
+      if (fixture.status === "scheduled") return time;
+      return time + 100000000000;
+    }
+
     function parseEloRatings(tsv) {
       state.eloRatings = {};
       tsv.trim().split("\n").forEach((line) => {
@@ -575,9 +707,9 @@
 
     async function loadEloData() {
       const [ratings, teams, fixtures] = await Promise.all([
-        fetchText("./elo-2026-world-cup.tsv"),
-        fetchText("./elo-teams.tsv"),
-        fetchText("./elo-fixtures.tsv")
+        fetchTextAny(["./assets/elo-2026-world-cup.tsv", "./elo-2026-world-cup.tsv"]),
+        fetchTextAny(["./assets/elo-teams.tsv", "./elo-teams.tsv"]),
+        fetchTextAny(["./assets/elo-fixtures.tsv", "./elo-fixtures.tsv"])
       ]);
       parseEloRatings(ratings);
       parseEloTeams(teams);
@@ -631,13 +763,16 @@
       }
     }
 
-    function fillTeams() {
+    function fillTeams(preserveSelection = false) {
+      const currentHome = byId("homeTeam").value;
+      const currentAway = byId("awayTeam").value;
       const names = [...new Set(state.fixtures.flatMap((fixture) => [fixture.homeTeam, fixture.awayTeam]))];
       const options = names.map((name) => `<option value="${name}">${labelTeam(name)}</option>`).join("");
       byId("homeTeam").innerHTML = options;
       byId("awayTeam").innerHTML = options;
-      byId("homeTeam").value = state.fixtures[0].homeTeam;
-      byId("awayTeam").value = state.fixtures[0].awayTeam;
+      const defaultFixture = state.fixtures.find((fixture) => fixture.status !== "finished") || state.fixtures[0];
+      byId("homeTeam").value = preserveSelection && names.includes(currentHome) ? currentHome : defaultFixture.homeTeam;
+      byId("awayTeam").value = preserveSelection && names.includes(currentAway) ? currentAway : defaultFixture.awayTeam;
     }
 
     function calcPrediction() {
@@ -858,10 +993,17 @@
       byId("awayAbbr").textContent = result.away.abbr;
       byId("homeName").textContent = result.home.zh;
       byId("awayName").textContent = result.away.zh;
-      byId("homeScore").textContent = result.homeScore;
-      byId("awayScore").textContent = result.awayScore;
-      byId("primaryScoreLabel").textContent = `${result.topScores[0].home}:${result.topScores[0].away} · ${pct(result.topScores[0].p)}`;
-      byId("alternateScoreLabel").textContent = `${result.topScores[1].home}:${result.topScores[1].away} · ${pct(result.topScores[1].p)}`;
+      const hasRealScore = ["live", "finished"].includes(result.fixture?.status) && result.fixture?.homeScore != null && result.fixture?.awayScore != null;
+      byId("homeScore").textContent = hasRealScore ? result.fixture.homeScore : result.homeScore;
+      byId("awayScore").textContent = hasRealScore ? result.fixture.awayScore : result.awayScore;
+      if (hasRealScore) {
+        const label = result.fixture.status === "finished" ? "真实赛果" : "实时比分";
+        byId("primaryScoreLabel").textContent = `${label} · ${result.fixture.statusLabel}`;
+        byId("alternateScoreLabel").textContent = `模型备选 ${result.topScores[0].home}:${result.topScores[0].away} / ${result.topScores[1].home}:${result.topScores[1].away}`;
+      } else {
+        byId("primaryScoreLabel").textContent = `${result.topScores[0].home}:${result.topScores[0].away} · ${pct(result.topScores[0].p)}`;
+        byId("alternateScoreLabel").textContent = `${result.topScores[1].home}:${result.topScores[1].away} · ${pct(result.topScores[1].p)}`;
+      }
       byId("homeWinLabel").textContent = `${result.home.zh}胜`;
       byId("awayWinLabel").textContent = `${result.away.zh}胜`;
       byId("homeWinPct").textContent = `${result.homeWin}%`;
@@ -931,18 +1073,20 @@
         const h = teamByName(fixture.homeTeam);
         const a = teamByName(fixture.awayTeam);
         const kickoff = new Date(fixture.kickoffUtc).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+        const scoreText = ["live", "finished"].includes(fixture.status) && fixture.homeScore != null && fixture.awayScore != null ? `${fixture.homeScore} : ${fixture.awayScore}` : "VS";
+        const statusClass = fixture.statusTone || "bg-white/8 text-white/58";
         return `
           <button class="fixture reveal w-full min-w-0 rounded-xl border border-white/10 bg-white/[0.04] p-5 text-left hover:border-[#dbff63]/50 hover:bg-white/[0.07]" type="button" data-home="${fixture.homeTeam}" data-away="${fixture.awayTeam}" data-pressure="${fixture.stage === "group-stage" ? 62 : 82}">
             <div class="mb-5 flex items-center justify-between">
               <span class="rounded-full bg-white/8 px-2.5 py-1 text-xs font-bold text-white/58">M${fixture.matchNumber} · ${fixture.group ? `Group ${fixture.group}` : fixture.stage}</span>
-              <i data-lucide="arrow-up-right" class="h-4 w-4 text-white/38"></i>
+              <span class="rounded-full px-2.5 py-1 text-xs font-black ${statusClass}">${fixture.statusLabel || "未开赛"}</span>
             </div>
             <div class="flex items-center justify-between gap-3">
               <div class="min-w-0">
                 <div class="text-xs font-black text-[#dbff63]">${h.abbr}</div>
                 <div class="mt-1 truncate text-lg font-black">${h.zh}</div>
               </div>
-              <span class="text-xs font-black text-white/35">VS</span>
+              <span class="score-digit shrink-0 rounded-lg bg-white px-3 py-2 text-lg font-black text-[#06110f]">${scoreText}</span>
               <div class="min-w-0 text-right">
                 <div class="text-xs font-black text-[#5cc8ff]">${a.abbr}</div>
                 <div class="mt-1 truncate text-lg font-black">${a.zh}</div>
@@ -950,7 +1094,7 @@
             </div>
             <div class="mt-5 border-t border-white/10 pt-4 text-xs font-bold text-white/45">
               <div class="flex items-center justify-between"><span>${kickoff}</span><span>${fixture.stadium}</span></div>
-              <div class="mt-2 truncate">${fixture.hostCity}</div>
+              <div class="mt-2 truncate">${fixture.homeScorers || fixture.awayScorers ? `${fixture.homeScorers || "-"} ｜ ${fixture.awayScorers || "-"}` : fixture.hostCity}</div>
             </div>
           </button>
         `;
@@ -1045,19 +1189,44 @@
 
     async function loadRealFixtures() {
       try {
-        const response = await fetch("https://www.thestatsapi.com/world-cup/data/fixtures.json", { cache: "no-store" });
-        if (!response.ok) throw new Error("fixture fetch failed");
-        const data = await response.json();
-        const now = new Date("2026-06-26T00:00:00Z");
-        const upcoming = data.fixtures
-          .filter((fixture) => fixture.date >= "2026-06-26" && new Date(fixture.kickoffUtc) >= now)
-          .filter((fixture) => !fixture.homeTeam.includes("Group ") && !fixture.awayTeam.includes("Group "))
-          .slice(0, 16);
-        state.fixtures = upcoming.length ? upcoming : fallbackFixtures;
-        byId("dataStatus").textContent = `真实赛程已加载：TheStatsAPI · ${state.fixtures.length} 场待预测比赛（完整数据源 104 场）`;
+        const [gamesData, stadiumData] = await Promise.all([
+          fetchJson(`${liveApiBase}/get/games`),
+          fetchJson(`${liveApiBase}/get/stadiums`)
+        ]);
+        state.stadiums = Object.fromEntries((stadiumData.stadiums || []).map((stadium) => [stadium.id, stadium]));
+        const now = Date.now();
+        const games = (gamesData.games || [])
+          .map(normalizeWorldCup26Game)
+          .filter((fixture) => fixture.homeTeam && fixture.awayTeam && !fixture.homeTeam.includes("Group ") && !fixture.awayTeam.includes("Group "));
+        const live = games.filter((fixture) => fixture.status === "live");
+        const upcoming = games
+          .filter((fixture) => fixture.status === "scheduled" && new Date(fixture.kickoffUtc).getTime() >= now - 3 * 60 * 60 * 1000)
+          .sort((a, b) => new Date(a.kickoffUtc) - new Date(b.kickoffUtc))
+          .slice(0, 18);
+        const recent = games
+          .filter((fixture) => fixture.status === "finished")
+          .sort((a, b) => new Date(b.kickoffUtc) - new Date(a.kickoffUtc))
+          .slice(0, 8);
+        const merged = [...live, ...upcoming, ...recent].sort((a, b) => fixtureSortValue(a) - fixtureSortValue(b));
+        state.fixtures = merged.length ? merged : fallbackFixtures;
+        state.liveSource = "WorldCup26";
+        state.liveUpdatedAt = new Date();
+        const stamp = state.liveUpdatedAt.toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" });
+        byId("dataStatus").textContent = `实时数据已更新：WorldCup26 API · ${state.fixtures.length} 场（含进行中/待赛/最近完赛）· ${stamp}`;
       } catch (error) {
-        state.fixtures = fallbackFixtures;
-        byId("dataStatus").textContent = "远程赛程读取失败，已使用本地真实赛程兜底：2026-06-26/27 世界杯小组赛。";
+        try {
+          const data = await fetchJson("https://www.thestatsapi.com/world-cup/data/fixtures.json");
+          const now = new Date();
+          const upcoming = data.fixtures
+            .filter((fixture) => new Date(fixture.kickoffUtc) >= now)
+            .filter((fixture) => !fixture.homeTeam.includes("Group ") && !fixture.awayTeam.includes("Group "))
+            .slice(0, 16);
+          state.fixtures = upcoming.length ? upcoming.map((fixture) => ({ ...fixture, status: "scheduled", statusLabel: "未开赛" })) : fallbackFixtures;
+          byId("dataStatus").textContent = `实时比分源暂不可用，已切到 TheStatsAPI 赛程兜底 · ${state.fixtures.length} 场`;
+        } catch (fallbackError) {
+          state.fixtures = fallbackFixtures.map((fixture) => ({ ...fixture, status: "scheduled", statusLabel: "未开赛" }));
+          byId("dataStatus").textContent = "远程数据读取失败，已使用本地赛程兜底。";
+        }
       }
     }
 
@@ -1071,6 +1240,12 @@
       bindEvents();
       observeReveals();
       lucide.createIcons();
+      setInterval(async () => {
+        await loadRealFixtures();
+        fillTeams(true);
+        renderFixtures();
+        renderPrediction(false);
+      }, 60000);
     }
 
     init();
